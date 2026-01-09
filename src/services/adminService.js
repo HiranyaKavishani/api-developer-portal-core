@@ -850,7 +850,6 @@ const getDevPortalApplicationDetails = async (req, res) => {
         });
         util.handleError(res, error);
     }
-
 }
 
 const deleteDevPortalApplication = async (req, res) => {
@@ -1118,6 +1117,30 @@ const deleteSubscription = async (req, res) => {
             timeout: 60000,
         }, async (t) => {
             const subscription = await adminDao.getSubscription(orgID, subID, t);
+            
+            // Check if this is a paid subscription and cancel Stripe subscription first
+            if (subscription && subscription.BILLING_SUBSCRIPTION_ID && subscription.PAYMENT_PROVIDER === 'STRIPE') {
+                try {
+                    logger.info('Canceling Stripe subscription before deleting', {
+                        subId: subID,
+                        billingSubscriptionId: subscription.BILLING_SUBSCRIPTION_ID
+                    });
+                    const monetizationService = require('./monetizationService');
+                    await monetizationService.cancelPaidSubscription({
+                        orgId: orgID,
+                        subId: subID,
+                        user: req.user || {}
+                    });
+                    logger.info('Stripe subscription canceled successfully', { subId: subID });
+                } catch (stripeErr) {
+                    // Log but don't fail the delete if Stripe cancellation fails
+                    logger.warn('Failed to cancel Stripe subscription (continuing with delete)', {
+                        subId: subID,
+                        error: stripeErr.message
+                    });
+                }
+            }
+
             const subDeleteResponse = await adminDao.deleteSubscription(orgID, subID, t);
             if (subDeleteResponse === 0) {
                 throw new Sequelize.EmptyResultError("Resource not found to delete");
@@ -1202,7 +1225,17 @@ const createAppKeyMapping = async (req, res) => {
             for (const sub of subAPIs) {
                 const api = new APIDTO(sub);
                 const policyDetails = await apiDao.getSubscriptionPolicy(api.policyID, orgID, t);
-                const cpSubscribeResponse = await createCPSubscription(req, api.apiReferenceID, cpAppID, policyDetails);
+                
+                // Get billing data if this is a paid subscription
+                let billingData = null;
+                if (sub.BILLING_CUSTOMER_ID && sub.BILLING_SUBSCRIPTION_ID) {
+                    billingData = {
+                        customerId: sub.BILLING_CUSTOMER_ID,
+                        subscriptionId: sub.BILLING_SUBSCRIPTION_ID
+                    };
+                }
+                
+                const cpSubscribeResponse = await createCPSubscription(req, api.apiReferenceID, cpAppID, policyDetails, billingData);
                 apiSubscriptions.push(cpSubscribeResponse);
             }
             //create app key mapping
@@ -1384,11 +1417,12 @@ const createCPApplication = async (req, cpApplicationName) => {
     }
 }
 
-const createCPSubscription = async (req, apiId, cpAppID, policyDetails) => {
+const createCPSubscription = async (req, apiId, cpAppID, policyDetails, billingData = null) => {
     logger.info('Creating control plane subscription', {
         apiId,
         cpAppID,
-        policyDetails: policyDetails.dataValues ? policyDetails.dataValues.POLICY_NAME : policyDetails
+        policyDetails: policyDetails.dataValues ? policyDetails.dataValues.POLICY_NAME : policyDetails,
+        billingData: billingData ? { customerId: billingData.customerId, subscriptionId: billingData.subscriptionId } : null
     });
     try {
         const requestBody = {
@@ -1396,6 +1430,15 @@ const createCPSubscription = async (req, apiId, cpAppID, policyDetails) => {
             applicationId: cpAppID,
             throttlingPolicy: policyDetails.dataValues ? policyDetails.dataValues.POLICY_NAME : policyDetails
         };
+        
+        // Add billing metadata if available (for paid subscriptions)
+        if (billingData) {
+            requestBody.billingMetadata = {
+                billingCustomerId: billingData.customerId,
+                billingSubscriptionId: billingData.subscriptionId
+            };
+        }
+        
         const cpSubscribeResponse = await invokeApiRequest(req, 'POST', `${controlPlaneUrl}/subscriptions`, {}, requestBody);
         return cpSubscribeResponse;
     } catch (error) {
@@ -1459,6 +1502,31 @@ const unsubscribeAPI = async (req, res) => {
     });
     try {
         const { appID, apiReferenceID, subscriptionID } = req.query;
+        
+        // Check if this is a paid subscription and cancel Stripe subscription if so
+        try {
+            const subscription = await adminDao.getSubscription(orgID, subscriptionID);
+            if (subscription && subscription.BILLING_SUBSCRIPTION_ID && subscription.PAYMENT_PROVIDER === 'STRIPE') {
+                logger.info('Canceling Stripe subscription for paid API subscription', {
+                    subscriptionID,
+                    billingSubscriptionId: subscription.BILLING_SUBSCRIPTION_ID
+                });
+                const monetizationService = require('./monetizationService');
+                await monetizationService.cancelPaidSubscription({
+                    orgId: orgID,
+                    subId: subscriptionID,
+                    user: req.user || {}
+                });
+                logger.info('Stripe subscription canceled successfully', { subscriptionID });
+            }
+        } catch (stripeErr) {
+            // Log but don't fail the unsubscribe if Stripe cancellation fails
+            logger.warn('Failed to cancel Stripe subscription (continuing with unsubscribe)', {
+                subscriptionID,
+                error: stripeErr.message
+            });
+        }
+        
         await sequelize.transaction({
             timeout: 60000,
         }, async (t) => {
